@@ -1,11 +1,24 @@
 # herdr-warp
 
-Native **Warp** desktop notifications when a **Herdr**-managed coding agent finishes
-or needs your attention.
+Native [**Warp**](https://warp.dev) desktop notifications when a
+[**Herdr**](https://herdr.dev)-managed coding agent finishes or needs your
+attention.
 
 Modelled on [`warpdotdev/claude-code-warp`](https://github.com/warpdotdev/claude-code-warp),
-but hooked into Herdr instead of Claude Code — so it covers *every* agent Herdr
-manages (Claude, Codex, Copilot, Droid, Kimi, Cursor, …), not just one.
+but this is a **Herdr plugin, not a Claude Code plugin** — it hooks Herdr's own
+agent-state machine, so it covers *every* agent Herdr manages rather than one.
+
+|                  | `claude-code-warp`                     | `herdr-warp`                          |
+|------------------|----------------------------------------|---------------------------------------|
+| Installs into    | Claude Code                            | **Herdr**                             |
+| Manifest         | `.claude-plugin/plugin.json` + `hooks/`| `herdr-plugin.toml`                   |
+| Triggered by     | Claude Code hooks (`Stop`, …)          | Herdr event `pane.agent_status_changed`|
+| Covers           | Claude Code only                       | **every agent Herdr integrates**      |
+| Notification     | OSC 777 `warp://cli-agent` (structured)| OSC 777 `notify` (plain) — see below  |
+
+It touches nothing in `~/.claude/`. It also *replaces* `claude-code-warp` when you
+run Claude Code inside Herdr: Herdr parses OSC 777 arriving from panes, so that
+plugin's notifications are swallowed and re-emitted in a format Warp ignores.
 
 ## Why this is needed
 
@@ -46,62 +59,103 @@ attention-worthy transition and lets Warp decide.
 One event hook, one script.
 
 ```
-pane.agent_status_changed  ──►  notify.py  ──►  ESC]777;notify;title;body BEL  ──►  Warp
+                    ┌──────────────────────── Warp (macOS app) ──────────────────────┐
+                    │  /dev/ttysNNN                                                  │
+                    │      ▲                                                         │
+                    │      │  ESC]777;notify;<title>;<body> BEL   ← notify.py writes │
+                    │      │                                         here, directly  │
+                    │  herdr client (TUI, owns this tty)                             │
+                    └──────┬─────────────────────────────────────────────────────────┘
+                           │ unix socket
+                    ┌──────┴─────────── herdr server (headless) ─────────────────────┐
+                    │                                                                │
+                    │  pane PTYs ──► agent-state detection                           │
+                    │                      │                                         │
+                    │                      ├─► sound            (herdr, works today) │
+                    │                      ├─► OSC 9 / OSC 99   (Warp ignores these) │
+                    │                      └─► pane.agent_status_changed              │
+                    │                                  │                             │
+                    │                                  ▼                             │
+                    │                             notify.py  ── plugin event hook     │
+                    └────────────────────────────────────────────────────────────────┘
 ```
 
-`notify.py` writes straight to the tty the **herdr client** is attached to (Warp's
-PTY), bypassing both the format mismatch and the background-only filter. It finds
-that tty by locating the herdr client process, falling back to walking its own
-process ancestry.
+The one thing to notice: **Warp sees a single PTY for the whole Herdr session**,
+no matter how many panes and agents run behind it. That single fact drives two
+design choices — a plain `notify` rather than the structured protocol, and the
+click-targeting limit. Both are explained under [Corner cases](#corner-cases).
+
+`notify.py` locates the herdr client process and writes to its tty. It does *not*
+fall back to its own process ancestry: inside a pane that resolves to the pane's
+own PTY, and Herdr swallows OSC 777 arriving from panes. No client attached means
+no outer terminal to notify, which is the correct answer rather than a failure.
 
 It notifies on two of Herdr's five agent states, matching Herdr's own two sound
-categories:
+categories (`request_path` = needs-attention, `done_path` = finished):
 
-| Herdr state | Notifies | Meaning                          |
-|-------------|----------|----------------------------------|
-| `blocked`   | yes      | needs your input / permission    |
-| `done`      | yes      | task finished                    |
-| `working`   | no       | —                                |
-| `idle`      | no       | —                                |
-| `unknown`   | no       | —                                |
+| Herdr state | Notifies | Meaning                       |
+|-------------|----------|-------------------------------|
+| `blocked`   | **yes**  | needs your input / permission |
+| `done`      | **yes**  | task finished                 |
+| `working`   | no       | in progress                   |
+| `idle`      | no       | sitting at its prompt         |
+| `unknown`   | no       | not an agent pane             |
 
-Notification text uses Herdr's own wording where it provides it:
+Notification text is `agent · workspace` over `state — where`:
 
 ```
-Claude · order-integrity-platform
-Needs your attention — Message explanation with examples
+Claude · portal
+Needs your attention — WEB-1204
 ```
+
+Herdr's own wording for the state is used when the event carries it. Real events
+are sparser than the schema allows, so: a missing `display_agent` falls back to a
+title-cased agent id, a missing `title` falls back to the pane's
+`terminal_title_stripped`, and Herdr's default numeric tab labels (`1`, `2`, …)
+are dropped rather than printed as `Finished — 1`.
 
 ## Install
 
 ```bash
-herdr plugin link /path/to/herdr-warp
-herdr plugin list                       # should show herdr-warp enabled
+herdr plugin install ProjectAJ14/herdr-warp
+herdr plugin list        # herdr-warp enabled, and NO "unknown event" warning
 ```
+
+Then **restart Herdr** — a plugin linked or installed mid-session is registered
+but its event hooks are not wired until the next server start. See
+[Activation](#activation).
 
 Requires Herdr ≥ 0.8.0, Warp, and `python3` (Herdr's own Claude integration
 already depends on python3). No `jq`, no other dependencies.
 
+For local development instead:
+
+```bash
+git clone https://github.com/ProjectAJ14/herdr-warp
+herdr plugin link ./herdr-warp
+```
+
 ## Verify
 
 ```bash
+cd "$(herdr plugin list --json 2>/dev/null | \
+      python3 -c 'import sys,json;print(json.load(sys.stdin)["result"]["plugins"][0]["plugin_root"])')"
 python3 notify.py --self-check   # offline assertions
 python3 notify.py --test         # fire one real notification
 ```
 
-For `--test`, **switch away from Warp** — Warp suppresses notifications while it
-is the focused app.
+For `--test`, **switch away from Warp** — Warp raises a desktop notification only
+while it is *not* the focused app, so a test run with Warp in front looks like a
+silent failure.
 
-Once linked, check the hook is firing after an agent changes state:
-
-```bash
-herdr plugin log list
-```
+`--test` also prints how many client ttys it wrote to. `0` means no Herdr client
+is attached, so there is no outer terminal to notify.
 
 ## Uninstall
 
 ```bash
-herdr plugin unlink herdr-warp
+herdr plugin uninstall herdr-warp   # installed from GitHub
+herdr plugin unlink herdr-warp      # linked locally
 ```
 
 ## Corner cases
@@ -241,3 +295,16 @@ After linking, always check:
 ```bash
 herdr plugin list        # must show no "unknown event" warning
 ```
+
+## References
+
+- [Herdr — plugins](https://herdr.dev/docs/plugins) — manifest format, event hooks, plugin env vars
+- [Herdr — configuration](https://herdr.dev/docs/configuration) — `[ui.toast]`, `[ui.sound]`, keybindings
+- [Herdr — socket API](https://herdr.dev/docs/socket-api) — `pane.agent_status_changed`, `session.snapshot`
+- [Warp — desktop notifications](https://docs.warp.dev/terminal/more-features/notifications/) — OSC 9 and OSC 777 formats
+- [Warp issue #7896](https://github.com/warpdotdev/Warp/issues/7896) — OSC 9 support, shipped 2026-03
+- [`warpdotdev/claude-code-warp`](https://github.com/warpdotdev/claude-code-warp) — the Claude Code equivalent this is modelled on
+
+## License
+
+MIT
