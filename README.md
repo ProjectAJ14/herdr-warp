@@ -183,10 +183,15 @@ Event hooks are fire-and-forget with nowhere to print, so `notify.py` has an
 opt-in breadcrumb log:
 
 ```bash
-touch "$(herdr plugin config-dir herdr-warp)/debug"
+CFG="$(herdr plugin config-dir herdr-warp)"
+touch "$CFG/debug" "${CFG/\/config\///state/}/debug"
 # ... let an agent finish or block ...
-cat "$(herdr plugin config-dir herdr-warp)/debug.log"
+cat "$CFG/debug.log" "${CFG/\/config\///state/}/debug.log" 2>/dev/null
 ```
+
+Herdr passes both `HERDR_PLUGIN_CONFIG_DIR` and `HERDR_PLUGIN_STATE_DIR`, and
+which one a hook run sees is not guaranteed, so flag both. The log lands next to
+whichever flag is found.
 
 Each line records the raw event Herdr passed in and how many ttys were written
 to. Delete the `debug` file to turn it back off.

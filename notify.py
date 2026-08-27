@@ -152,7 +152,7 @@ def _call(method, params):
 
 
 def locate(pane_id, workspace_id):
-    """(workspace label, tab label) so the notification says where to go.
+    """(workspace label, tab label, pane title) -- where to go, and what it is.
 
     A Warp notification click can only reach the Warp tab hosting the herdr
     client -- Warp sees one PTY for every herdr pane -- so naming the workspace
@@ -163,16 +163,18 @@ def locate(pane_id, workspace_id):
     try:
         snap = reply["result"]["snapshot"]
     except (TypeError, KeyError):
-        return workspace_id or "", ""
+        return workspace_id or "", "", ""
 
-    ws_label, tab_id = workspace_id or "", None
+    ws_label, tab_id, pane_title = workspace_id or "", None, ""
     for ws in snap.get("workspaces", []):
         if ws.get("workspace_id") == workspace_id:
             ws_label = ws.get("label") or ws_label
             break
-    for pane in snap.get("panes", []) + snap.get("agents", []):
+    for pane in snap.get("agents", []) + snap.get("panes", []):
         if pane.get("pane_id") == pane_id:
             tab_id = pane.get("tab_id")
+            pane_title = (pane.get("terminal_title_stripped")
+                          or pane.get("label") or "")
             break
     tab_label = ""
     if tab_id:
@@ -180,15 +182,18 @@ def locate(pane_id, workspace_id):
             if tab.get("tab_id") == tab_id:
                 tab_label = tab.get("label") or ""
                 break
-    return ws_label, tab_label
+    return ws_label, tab_label, pane_title
 
 
-def compose(event, ws_label, tab_label=""):
+def compose(event, ws_label, tab_label="", pane_title=""):
     """(title, body) for an event, or None if this event is not worth a toast."""
     status = event.get("agent_status")
     if status not in NOTIFY_STATES:
         return None
-    agent = event.get("display_agent") or event.get("agent") or "Agent"
+    # Real events often omit display_agent, leaving a bare id like "claude".
+    agent = event.get("display_agent") or ""
+    if not agent:
+        agent = (event.get("agent") or "Agent").replace("-", " ").title()
     # Herdr's own wording for the state when it has one, else our fallback.
     state = (event.get("state_labels") or {}).get(status) or NOTIFY_STATES[status]
 
@@ -197,8 +202,13 @@ def compose(event, ws_label, tab_label=""):
 
     # Name the destination: tab first, then the pane/conversation title. Skip
     # either when it just repeats what is already on screen.
+    # Herdr names tabs "1", "2", ... until you rename them; a bare number is
+    # noise in a notification, so drop it.
+    if tab_label.strip().isdigit():
+        tab_label = ""
     detail = []
-    for part in (sanitize(tab_label, 40), sanitize(event.get("title"), 120)):
+    for part in (sanitize(tab_label, 40),
+                 sanitize(event.get("title") or pane_title, 120)):
         if part and part not in detail and part != body and part != ws_label:
             detail.append(part)
     # A tab label is often a prefix of the pane title; keep only the longer one.
@@ -228,15 +238,16 @@ def trace(msg):
     An event hook is fire-and-forget with nowhere to print, so this is the only
     way to see what it did.
     """
-    state = (os.environ.get("HERDR_PLUGIN_STATE_DIR")
-             or os.environ.get("HERDR_PLUGIN_CONFIG_DIR"))
-    if not state or not os.path.exists(os.path.join(state, "debug")):
+    for var in ("HERDR_PLUGIN_STATE_DIR", "HERDR_PLUGIN_CONFIG_DIR"):
+        d = os.environ.get(var)
+        if not d or not os.path.exists(os.path.join(d, "debug")):
+            continue
+        try:
+            with open(os.path.join(d, "debug.log"), "a") as fh:
+                fh.write("%s %s\n" % (int(time.time()), msg))
+        except OSError:
+            pass
         return
-    try:
-        with open(os.path.join(state, "debug.log"), "a") as fh:
-            fh.write("%s %s\n" % (int(time.time()), msg))
-    except OSError:
-        pass
 
 
 def main():
@@ -251,8 +262,9 @@ def main():
     if not compose(event, ""):
         return 0
     # Only pay for the socket round-trip once we know we are notifying.
-    ws_label, tab_label = locate(event.get("pane_id"), event.get("workspace_id"))
-    title, body = compose(event, ws_label, tab_label)
+    ws_label, tab_label, pane_title = locate(event.get("pane_id"),
+                                             event.get("workspace_id"))
+    title, body = compose(event, ws_label, tab_label, pane_title)
     sent = emit(title, body)
     trace("notified %d tty(s): %s | %s" % (sent, title, body))
     return 0
@@ -286,6 +298,26 @@ def self_check():
                     "title": "WEB-1204 - 27 Aug - main"}, "portal", "WEB-1204")
     assert b == "Finished — WEB-1204 - 27 Aug - main", b
 
+    # A bare agent id gets title-cased; a numeric tab label is dropped and the
+    # pane title stands in when the event carries no title of its own. This is
+    # the exact shape of the first real event observed: it produced
+    # "claude · herdr-warp / Finished - 1" before this fix.
+    t, b = compose({"agent_status": "done", "agent": "claude"},
+                   "herdr-warp", "1", "Herdr notification plugin")
+    assert t == "Claude · herdr-warp", t
+    assert b == "Finished — Herdr notification plugin", b
+
+    # display_agent still wins when present, verbatim.
+    t, _ = compose({"agent_status": "done", "agent": "claude",
+                    "display_agent": "Claude Code"}, "w")
+    assert t == "Claude Code · w", t
+    # Hyphenated ids read as words.
+    t, _ = compose({"agent_status": "done", "agent": "antigravity-cli"}, "w")
+    assert t == "Antigravity Cli · w", t
+    # No title anywhere -> state alone, no dangling separator.
+    _, b = compose({"agent_status": "blocked", "agent": "c"}, "w", "3", "")
+    assert b == "Needs your attention", b
+
     # A tab label repeating the workspace adds nothing.
     _, b = compose({"agent_status": "done", "agent": "c"}, "portal", "portal")
     assert b == "Finished", b
@@ -293,7 +325,7 @@ def self_check():
     # Herdr's own state wording wins over our fallback.
     t, b = compose({"agent_status": "blocked", "agent": "codex",
                     "state_labels": {"blocked": "needs input"}}, "api")
-    assert (t, b) == ("codex · api", "Needs input"), (t, b)
+    assert (t, b) == ("Codex · api", "Needs input"), (t, b)
 
     # A duplicated detail must not be repeated in the body.
     _, b = compose({"agent_status": "done", "agent": "c", "title": "Finished"},
@@ -302,14 +334,14 @@ def self_check():
 
     # No workspace label -> agent name alone, never a stray separator.
     t, _ = compose({"agent_status": "done", "agent": "droid"}, "")
-    assert t == "droid", t
+    assert t == "Droid", t
 
     # Real envelope shape, captured from the socket API.
     ev = unwrap('{"event":"pane_agent_status_changed","data":'
                 '{"agent_status":"done","agent":"claude","pane_id":"w7:p5",'
                 '"workspace_id":"w7","title":"T"}}')
     assert ev["agent_status"] == "done", ev
-    assert compose(ev, "w") == ("claude · w", "Finished — T")
+    assert compose(ev, "w") == ("Claude · w", "Finished — T")
     assert compose(ev, "w", "tab1")[1] == "Finished — tab1 · T"
     # A bare payload still works.
     assert unwrap('{"agent_status":"idle"}')["agent_status"] == "idle"
