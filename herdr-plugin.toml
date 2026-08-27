@@ -1,0 +1,14 @@
+id = "herdr-warp"
+name = "Herdr → Warp Notifications"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Native Warp desktop notifications when a Herdr-managed agent finishes or needs your attention."
+platforms = ["macos", "linux"]
+
+# Herdr's own `[ui.toast] delivery = "terminal"` emits OSC 9 / OSC 99 with an ST
+# terminator and only for background workspaces. Warp wants OSC 777 with a BEL
+# terminator, and gates on *Warp* being unfocused — which is the gate we want.
+# So translate the event ourselves.
+[[events]]
+on = "pane.agent_status_changed"
+command = ["python3", "notify.py"]
