@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  # Never let two releases race; a second push waits rather than publishing
+  # a version the first one is still tagging.
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # commit the version bump, push the tag, create the release
+      issues: write         # semantic-release comments on released issues
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0            # semantic-release reads the whole tag history
+          persist-credentials: false
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+
+      - name: Install release tooling
+        run: npm ci
+
+      # The plugin's own gate. notify.py is the whole plugin and its self-check
+      # is the whole suite; a release that ships a broken compose() is worse
+      # than no release. Python 3 is preinstalled on ubuntu-latest, and the
+      # plugin targets the system python (3.9 on macOS), so no setup-python.
+      - name: Self-check
+        run: python3 notify.py --self-check
+
+      - name: Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx semantic-release

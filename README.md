@@ -148,9 +148,14 @@ located at all the body says `Open Herdr to pick it up`.
 ## Install
 
 ```bash
-herdr plugin install ProjectAJ14/herdr-warp
+herdr plugin install ProjectAJ14/herdr-warp            # latest on main
+herdr plugin install ProjectAJ14/herdr-warp --ref v0.2.0   # pin a release
 herdr plugin list        # herdr-warp enabled, and NO "unknown event" warning
 ```
+
+Releases are tagged `vX.Y.Z` — see [Releases](#releases). Without `--ref` you
+get whatever is on `main`, which is fine for a plugin this small; pin a tag if
+you would rather choose when notification text changes under you.
 
 Then **restart Herdr** — a plugin linked or installed mid-session is registered
 but its event hooks are not wired until the next server start. See
@@ -304,6 +309,37 @@ The body is the route: workspace first, then tab, then what the agent is on — 
 one glance tells you which space and which pane to switch to. Redundant hops are
 dropped: a numeric tab label, a tab label the pane title already starts with, and
 a tab label that just repeats the workspace name.
+
+## Releases
+
+[Conventional Commits](https://www.conventionalcommits.org) and
+[semantic-release](https://semantic-release.gitbook.io): every push to `main`
+runs `.github/workflows/release.yml`, which runs the self-check, works out the
+version from the commit messages, and — if anything user-facing landed — bumps
+`herdr-plugin.toml`, writes `CHANGELOG.md`, tags `vX.Y.Z` and cuts a GitHub
+Release.
+
+| Commit prefix | Release |
+|---|---|
+| `feat:` | minor |
+| `fix:` / `perf:` | patch |
+| `docs:` `chore:` `refactor:` `test:` `ci:` | none |
+| `BREAKING CHANGE:` in the body | major |
+
+So `docs:` for README work and `feat:`/`fix:` for anything that changes what a
+notification says or when it fires. The version in `herdr-plugin.toml` is
+owned by the release job — never edit it by hand, or it drifts from the tag
+that `--ref` resolves against.
+
+To see what your commits would cut, without publishing anything:
+
+```bash
+npm ci && npm run release:dry
+```
+
+`package.json` exists only for that tooling. Nothing is published to npm — the
+plugin is `notify.py` plus the manifest, installed by Herdr straight from this
+repo, and it stays stdlib-only python.
 
 ## Notes
 
