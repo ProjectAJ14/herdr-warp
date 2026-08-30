@@ -59,24 +59,30 @@ attention-worthy transition and lets Warp decide.
 One event hook, one script.
 
 ```
-                    ┌──────────────────────── Warp (macOS app) ──────────────────────┐
+                    ┌─────────────────────── Warp (macOS app) ───────────────────────┐
                     │  /dev/ttysNNN                                                  │
                     │      ▲                                                         │
-                    │      │  ESC]777;notify;<title>;<body> BEL   ← notify.py writes │
-                    │      │                                         here, directly  │
-                    │  herdr client (TUI, owns this tty)                             │
+                    │      │  ESC]777;notify;<title>;<body> BEL   ← notify.py        │
+                    │      │                                        writes here      │
+                    │  herdr client (TUI) ── owns that tty, draws the in-app toast   │
                     └──────┬─────────────────────────────────────────────────────────┘
                            │ unix socket
-                    ┌──────┴─────────── herdr server (headless) ─────────────────────┐
+                    ┌──────┴──────────── herdr server (headless) ────────────────────┐
                     │                                                                │
                     │  pane PTYs ──► agent-state detection                           │
                     │                      │                                         │
-                    │                      ├─► sound            (herdr, works today) │
-                    │                      ├─► OSC 9 / OSC 99   (Warp ignores these) │
-                    │                      └─► pane.agent_status_changed              │
+                    │                      ├─► sound          (herdr, works today)   │
+                    │                      ├─► OSC 9 / OSC 99 (Warp ignores these)   │
+                    │                      └─► pane.agent_status_changed             │
                     │                                  │                             │
                     │                                  ▼                             │
-                    │                             notify.py  ── plugin event hook     │
+                    │                             notify.py ── plugin event hook     │
+                    │                                  │                             │
+                    │              ┌───────────────────┴───────────────────┐         │
+                    │              ▼                                       ▼         │
+                    │      OSC 777 to that tty                  notification.show    │
+                    │      Warp desktop notification            Herdr in-app toast   │
+                    │      (any workspace)                      (focused workspace)  │
                     └────────────────────────────────────────────────────────────────┘
 ```
 
@@ -90,6 +96,12 @@ fall back to its own process ancestry: inside a pane that resolves to the pane's
 own PTY, and Herdr swallows OSC 777 arriving from panes. No client attached means
 no outer terminal to notify, which is the correct answer rather than a failure.
 
+The second leg goes back over the socket: the same two strings are handed to
+`notification.show`, so the message you get on screen while Herdr is in front of
+you is the one you would have got on the desktop. Herdr draws that toast, so it
+picks up the active theme for free — see
+[When Warp is visible](#when-warp-is-visible-show-it-on-the-current-screen-instead).
+
 It notifies on two of Herdr's five agent states, matching Herdr's own two sound
 categories (`request_path` = needs-attention, `done_path` = finished):
 
@@ -101,18 +113,37 @@ categories (`request_path` = needs-attention, `done_path` = finished):
 | `idle`      | no       | sitting at its prompt         |
 | `unknown`   | no       | not an agent pane             |
 
-Notification text is `agent · workspace` over `state — where`:
+Both surfaces get the same two strings — **title says who wants what, body says
+where to go**:
 
 ```
-Claude · portal
-Needs your attention — WEB-1204
+🔔 Claude needs you
+portal › WEB-1204 › add text to loading page
 ```
 
-Herdr's own wording for the state is used when the event carries it. Real events
-are sparser than the schema allows, so: a missing `display_agent` falls back to a
-title-cased agent id, a missing `title` falls back to the pane's
-`terminal_title_stripped`, and Herdr's default numeric tab labels (`1`, `2`, …)
-are dropped rather than printed as `Finished — 1`.
+```
+✅ Claude finished
+herdr-warp › main › docs: fix the topology map
+```
+
+The body is a `workspace › tab › what the agent is on` path, in the order you
+would walk it: which space, which tab, which conversation. macOS renders the
+title bold above the body and Herdr's in-app toast stacks them the same way, so
+the same glance answers "who, what, where" on either surface.
+
+The glyph is the only colour on offer. A macOS banner is fixed chrome and
+Herdr's toast is drawn from the **active theme** (`[theme] name`, or whichever
+half of `auto_switch` is live) — so the plugin passes text only. Hardcoding a
+colour here would fight whichever theme is loaded, and `auto_switch` flips it
+under you anyway.
+
+Herdr's own wording for the state is used when the event carries it
+(`🔔 Codex needs input`). Real events are sparser than the schema allows, so: a
+missing `display_agent` falls back to a title-cased agent id, a missing `title`
+falls back to the pane's `terminal_title_stripped`, Herdr's default numeric tab
+labels (`1`, `2`, …) are dropped rather than printed as a destination, a tab
+label that only prefixes the pane title collapses into it, and with nothing
+located at all the body says `Open Herdr to pick it up`.
 
 ## Install
 
@@ -141,15 +172,24 @@ herdr plugin link ./herdr-warp
 cd "$(herdr plugin list --json 2>/dev/null | \
       python3 -c 'import sys,json;print(json.load(sys.stdin)["result"]["plugins"][0]["plugin_root"])')"
 python3 notify.py --self-check   # offline assertions
-python3 notify.py --test         # fire one real notification
+HERDR_SOCKET_PATH=~/.config/herdr/herdr.sock \
+  python3 notify.py --test       # fire one real notification on both surfaces
 ```
 
-For `--test`, **switch away from Warp** — Warp raises a desktop notification only
-while it is *not* the focused app, so a test run with Warp in front looks like a
-silent failure.
+```
+osc 777 -> 1 client tty(s): ['/dev/ttys000']
+herdr toast (delivery=herdr): shown
+```
 
-`--test` also prints how many client ttys it wrote to. `0` means no Herdr client
-is attached, so there is no outer terminal to notify.
+The first line is the Warp desktop notification: for that one, **switch away from
+Warp** — Warp raises it only while it is *not* the focused app, so a test run with
+Warp in front looks like a silent failure. `0` ttys means no Herdr client is
+attached, so there is no outer terminal to notify.
+
+The second line is the on-screen popup. `skipped` means `[ui.toast] delivery` is
+not `"herdr"`; `disabled`, `busy` (a toast is already up) and
+`no_foreground_client` come straight from Herdr. `HERDR_SOCKET_PATH` is set for you when Herdr runs the hook — it is
+only needed by hand.
 
 ## Uninstall
 
@@ -174,24 +214,66 @@ already the right gate, and it is the only component that knows.
 
 ```toml
 [ui.toast]
-delivery = "herdr"      # in-app toast  <- recommended with this plugin
+delivery = "herdr"      # in-app toast  <- required for the on-screen popup
 # delivery = "terminal" # OSC 9/99 to the outer terminal (Warp ignores these)
 ```
 
-With `delivery = "terminal"` you get **neither**: Warp cannot read Herdr's OSC 9,
-and Herdr suppresses its own in-app toast because it thinks the terminal is
-handling it. Switch it to `"herdr"` and the two halves stop overlapping:
+With `delivery = "terminal"` you get **neither** on-screen: Warp cannot read
+Herdr's OSC 9, and Herdr suppresses its own in-app toast because it thinks the
+terminal is handling it. (The Warp desktop notification is unaffected either
+way — this plugin writes OSC 777 itself and does not go through `delivery`.)
+
+Under `delivery = "herdr"` the on-screen popup is split by workspace, because
+Herdr toasts **background** workspaces itself and only those:
+
+| Agent is in | On-screen popup | Text |
+|---|---|---|
+| the workspace you are looking at | from this plugin (`notification.show`) | `🔔 Claude needs you` / `space › tab › task` |
+| a background workspace | from Herdr, as always | Herdr's own |
+
+Split that way one event never produces two toasts. If you would rather have
+this plugin's wording on *every* workspace and can live with a double toast on
+background ones, drop the `if focused` guard on the `toast(...)` call in
+`notify.py`.
 
 | You are looking at | What you get | From |
 |---|---|---|
-| the Herdr UI in Warp | in-app toast, bottom-right | Herdr (`delivery = "herdr"`) |
+| the Herdr UI in Warp | in-app toast, positioned by `[ui.toast.herdr] position` | Herdr, drawn in the active theme |
 | another app | Warp desktop notification | this plugin (OSC 777) |
 
-They are mutually exclusive by focus, so you never get both for one event.
+#### How long the on-screen popup stays up
 
-Note that Herdr's in-app toast only fires for **background** workspaces — the
-pane you are already watching does not toast itself, which is the intended
-behaviour.
+Herdr 0.8 exposes no dwell setting — `[ui.toast]` has only `delivery` and
+`delay_seconds`, and `delay_seconds` is a debounce *before* notifying, not a
+duration. Its own dwell measures **~3.3 s**, which you can see over the socket:
+
+```
+0.00s  notification.show -> shown
+2.00s  notification.show -> busy     # the first toast is still up
+4.00s  notification.show -> shown    # it expired, this one replaced it
+```
+
+`busy` is also the reason Herdr will not simply refresh a live toast. So
+`notify.py` re-shows it the instant the slot frees, which buys another full
+dwell — **~6.3 s on screen**, verified. Four knobs at the top of the file:
+
+```python
+TOAST_HOLD_CYCLES = 1      # 0 = leave Herdr's own timing alone; 1 ≈ double
+TOAST_DWELL_SECONDS = 2.5  # sleep before polling; must land *before* ~3.3 s
+TOAST_POLL_SECONDS = 0.1   # bounds the seam between the two toasts
+TOAST_POLL_LIMIT = 3.0     # give up rather than spin
+```
+
+A cycle is the granularity, so 2× is the closest reachable step up from 1× —
+there is no half cycle. `TOAST_DWELL_SECONDS` is a calibration knob, not
+arithmetic: it only has to land shortly *before* Herdr's dwell so the poll
+catches the hand-off within one interval. Herdr's dwell is internal and will
+drift between versions; if the seam starts to flicker, lower it. Each cycle
+costs ~7 `notification.show` calls, which show up in `herdr-server.log`.
+
+For the **desktop** notification the dwell time is macOS's, not ours: set Warp
+to **Alerts** instead of **Banners** in System Settings › Notifications › Warp
+and it stays until you dismiss it.
 
 ### Clicking the notification should land me on the right pane
 
@@ -214,22 +296,25 @@ What does work:
 To make step 2 optional, the notification names its own destination:
 
 ```
-Claude · portal
-Needs your attention — WEB-1204 - 27 Aug 26 - feat/WEB-1204/...
+🔔 Claude needs you
+portal › WEB-1204 - 27 Aug 26 - feat/WEB-1204/...
 ```
 
-Title is `agent · workspace`; the body leads with the tab label, so one glance
-tells you which workspace and tab to switch to. The tab label is dropped when the
-pane title already starts with it, and when it just repeats the workspace name.
+The body is the route: workspace first, then tab, then what the agent is on — so
+one glance tells you which space and which pane to switch to. Redundant hops are
+dropped: a numeric tab label, a tab label the pane title already starts with, and
+a tab label that just repeats the workspace name.
 
 ## Notes
 
 - Keep Herdr's sound on (`[ui.sound] enabled = true`) if you want both; this
   plugin only adds the visual notification.
-- `[ui.toast] delivery` can stay as-is. Set it to `"off"` if you want to avoid
-  Herdr's in-app toast on top of the Warp notification.
-- Which states notify is a two-entry dict at the top of `notify.py`
-  (`NOTIFY_STATES`) — edit it if you want `idle` too.
+- `[ui.toast] delivery = "herdr"` is what turns the on-screen popup on; `"off"`
+  leaves only the Warp desktop notification.
+- Which states notify, and the glyph and wording for each, is a two-entry dict at
+  the top of `notify.py` (`STATES`) — edit it if you want `idle` too.
+- Holding the on-screen popup open keeps the hook process alive for ~3 s. Herdr
+  spawns hooks detached, so this does not block the server or the event loop.
 
 ## Troubleshooting
 
