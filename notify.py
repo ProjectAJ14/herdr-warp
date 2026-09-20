@@ -67,11 +67,19 @@ TOAST_POLL_LIMIT = 3.0
 CLIENT_SUBCOMMANDS = ("session",)
 
 
+# A pane title is whatever the program inside the pane last wrote, so it is
+# untrusted: an ESC or BEL in it would close our OSC sequence early and leave
+# the rest on the tty as literal text. Whitespace controls are left in for
+# split() below to fold into spaces; the rest are dropped.
+CONTROL = dict.fromkeys(
+    [c for c in range(0x20) if chr(c) not in " \t\n\r\v\f"] + [0x7F])
+
+
 def sanitize(text, limit=200):
-    """Warp's OSC 777 payload is semicolon-delimited and single-line."""
+    """Warp's OSC 777 payload is semicolon-delimited, single-line, BEL-ended."""
     if not text:
         return ""
-    out = " ".join(str(text).split()).replace(";", ",")
+    out = " ".join(str(text).translate(CONTROL).split()).replace(";", ",")
     return out[: limit - 1] + "…" if len(out) > limit else out
 
 
@@ -384,6 +392,10 @@ def self_check():
     assert sanitize("a\nb  c") == "a b c"
     assert sanitize("x" * 300, 10) == "x" * 9 + "…"
     assert sanitize(None) == ""
+    # A pane title carrying ESC/BEL must not be able to close the sequence.
+    assert sanitize("a\x07b") == "ab"
+    assert sanitize("\033]777;notify;x") == "]777,notify,x"
+    assert "\033" not in osc777(sanitize("\033x"), "b")[1:]
 
     # Only blocked/done notify.
     for status in ("working", "idle", "unknown", None):
