@@ -193,8 +193,8 @@ attached, so there is no outer terminal to notify.
 
 The second line is the on-screen popup. `skipped` means `[ui.toast] delivery` is
 not `"herdr"`; `disabled`, `busy` (a toast is already up) and
-`no_foreground_client` come straight from Herdr. `HERDR_SOCKET_PATH` is set for you when Herdr runs the hook — it is
-only needed by hand.
+`no_foreground_client` come straight from Herdr. `HERDR_SOCKET_PATH` is set
+for you when Herdr runs the hook — you only pass it by hand.
 
 ## Uninstall
 
@@ -298,17 +298,9 @@ What does work:
 2. Press **`prefix`+`o`** (`ctrl+b o` with your prefix) → Herdr's
    `open_notification_target` jumps to the pane that raised the notification.
 
-To make step 2 optional, the notification names its own destination:
-
-```
-🔔 Claude needs you
-portal › WEB-1204 - 27 Aug 26 - feat/WEB-1204/...
-```
-
-The body is the route: workspace first, then tab, then what the agent is on — so
-one glance tells you which space and which pane to switch to. Redundant hops are
-dropped: a numeric tab label, a tab label the pane title already starts with, and
-a tab label that just repeats the workspace name.
+To make step 2 optional, the body names its own destination — `workspace › tab ›
+task`, so one glance tells you which space and which pane to switch to. See
+[How it works](#how-it-works) for the shape and the hops it drops.
 
 ## Releases
 
@@ -323,7 +315,7 @@ Release.
 |---|---|
 | `feat:` | minor |
 | `fix:` / `perf:` | patch |
-| `docs:` `chore:` `refactor:` `test:` `ci:` | none |
+| `docs:` `chore:` `refactor:` `test:` `style:` `ci:` `build:` | none |
 | `BREAKING CHANGE:` in the body | major |
 
 So `docs:` for README work and `feat:`/`fix:` for anything that changes what a
