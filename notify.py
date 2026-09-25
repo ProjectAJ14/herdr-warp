@@ -25,6 +25,9 @@ still toast themselves, so no event ever produces two. Needs
 `[ui.toast] delivery = "herdr"`, the only delivery that draws in-app, and it is
 held open for about twice Herdr's own dwell -- see the knobs below.
 
+Clicking the desktop notification lands on the pane that raised it: a detached
+waiter sees Warp come back to the front and calls `pane.focus` (macOS only).
+
 Run `python3 notify.py --self-check` for the offline assertions, or
 `python3 notify.py --test` to fire one real notification.
 """
@@ -62,6 +65,15 @@ TOAST_HOLD_CYCLES = 1
 TOAST_DWELL_SECONDS = 2.5
 TOAST_POLL_SECONDS = 0.1
 TOAST_POLL_LIMIT = 3.0
+
+# Click-to-jump. Warp's notification click only brings Warp forward -- it has
+# no callback and cannot see herdr panes -- so we watch for the effect instead:
+# once Warp is back in front, `pane.focus` the pane that notified. That call
+# switches workspace, tab and pane in one go (measured). Set JUMP_WAIT_SECONDS
+# = 0 to turn it off.
+JUMP_WAIT_SECONDS = 1800
+JUMP_POLL_SECONDS = 0.3
+WARP_BUNDLE_PREFIX = "dev.warp."
 
 # `herdr session attach <name>` is the only client form that leads with a word.
 CLIENT_SUBCOMMANDS = ("session",)
@@ -250,13 +262,106 @@ def toast(title, body):
     return reason
 
 
+def warp_in_front():
+    """True/False on macOS; None where there is no `lsappinfo` to ask."""
+    try:
+        asn = subprocess.run(["lsappinfo", "front"], capture_output=True,
+                             text=True, timeout=3).stdout.strip()
+        info = subprocess.run(["lsappinfo", "info", "-only", "bundleid", asn],
+                              capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return ('"%s' % WARP_BUNDLE_PREFIX) in info
+
+
+def _state_dir():
+    return (os.environ.get("HERDR_PLUGIN_STATE_DIR")
+            or os.environ.get("HERDR_PLUGIN_CONFIG_DIR"))
+
+
+def arm_jump(pane_id):
+    """Land on `pane_id` the next time Warp comes to the front.
+
+    Only armed while Warp is in the background -- that is when Warp shows the
+    desktop notification, so coming back to Warp means you clicked it (or
+    switched back yourself, which is just as good a reason to land there).
+
+    The target lives in a file and one detached waiter polls for it, so a burst
+    of events costs one poller and the latest one wins. The file carries the
+    socket too: the state dir is shared by every herdr session, and the waiter
+    may have been started by a different one.
+    """
+    d = _state_dir()
+    sock = os.environ.get("HERDR_SOCKET_PATH")
+    if not (JUMP_WAIT_SECONDS and pane_id and d and sock) \
+            or warp_in_front() is not False:
+        return False
+    try:
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "jump"), "w") as fh:
+            fh.write("%s\n%s\n" % (sock, pane_id))
+        # Detach: the hook returns now; the waiter outlives it in its own
+        # session, with no pipes back to Herdr to hold open.
+        if os.fork():
+            return True
+    except OSError:
+        return False
+    try:
+        os.setsid()
+        null = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(null, fd)
+        _wait_and_jump(d)
+    finally:
+        os._exit(0)
+
+
+def _wait_and_jump(d):
+    import fcntl
+    lock = open(os.path.join(d, "jump.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return      # a waiter is already running; it reads our target
+    target = os.path.join(d, "jump")
+    # The clock is the target's mtime, so each new event restarts it and the
+    # latest notification always gets the full window.
+    while True:
+        try:
+            age = time.time() - os.path.getmtime(target)
+        except OSError:
+            return          # already taken
+        if age >= JUMP_WAIT_SECONDS:
+            # Expired: coming back hours later should not yank you anywhere.
+            # ponytail: an event written between the stat and this remove is
+            # dropped -- a window of one poll, once per JUMP_WAIT_SECONDS.
+            try:
+                os.remove(target)
+            except OSError:
+                pass
+            return
+        if warp_in_front():
+            break
+        time.sleep(JUMP_POLL_SECONDS)
+    try:
+        with open(target) as fh:
+            sock, pane_id = fh.read().splitlines()[:2]
+        os.remove(target)
+    except (OSError, ValueError):
+        return
+    os.environ["HERDR_SOCKET_PATH"] = sock
+    reply = _call("pane.focus", {"pane_id": pane_id})
+    trace("jumped to %s: %s"
+          % (pane_id, "ok" if reply and "result" in reply else reply))
+
+
 def locate(pane_id, workspace_id):
     """(workspace label, tab label, pane title, workspace is focused).
 
-    A Warp notification click can only reach the Warp tab hosting the herdr
-    client -- Warp sees one PTY for every herdr pane -- so naming the workspace
-    and tab is what actually gets the reader to the right place. Herdr's own
-    `prefix+o` (open_notification_target) jumps there directly.
+    Warp sees one PTY for every herdr pane, so its notification click only
+    reaches the herdr tab; arm_jump() does the rest for the latest one. Naming
+    the workspace and tab in the body covers the others, as does Herdr's own
+    `prefix+o` (open_notification_target).
 
     The focus flag is what keeps the in-app toast from doubling up: Herdr toasts
     background workspaces itself, and only those.
@@ -375,13 +480,209 @@ def main():
                                                       event.get("workspace_id"))
     title, body = compose(event, ws_label, tab_label, pane_title)
     sent = emit(title, body)
+    armed = sent and arm_jump(event.get("pane_id"))
     # Herdr already toasts background workspaces (with its own sparser text);
     # ours covers the workspace you are looking at, which Herdr deliberately
     # skips. Split that way, one event never produces two toasts.
     reason = toast(title, body) if focused else None
-    trace("notified %d tty(s), toast=%s: %s | %s"
-          % (sent, reason or "skipped", title, body))
+    trace("notified %d tty(s), toast=%s, jump=%s: %s | %s"
+          % (sent, reason or "skipped", "armed" if armed else "no",
+             title, body))
     return 0
+
+
+def check_jump():
+    """Click-to-jump: the frontmost probe, the waiter, the guards, and the real
+    fork against a fake herdr socket. Part of --self-check."""
+    import fcntl
+    import tempfile
+    import threading
+
+    saved = (_call, time.sleep, warp_in_front, subprocess.run,
+             dict(os.environ))
+    d = tempfile.mkdtemp()
+    target = os.path.join(d, "jump")
+
+    def put(pane_id, sock="/tmp/herdr-b.sock", age=0):
+        with open(target, "w") as fh:
+            fh.write("%s\n%s\n" % (sock, pane_id))
+        if age:
+            t = time.time() - age
+            os.utime(target, (t, t))
+
+    try:
+        # warp_in_front parses `lsappinfo info`, and says None where there is
+        # no lsappinfo (Linux) so the caller never arms.
+        def run_with(bundle):
+            def run(argv, **_kw):
+                if bundle is None:
+                    raise OSError("no lsappinfo")
+                out = ("ASN:0x0-0x1:" if argv[1] == "front" else
+                       '[ NULL ]  ASN:0x0-0x1: (in front)\n'
+                       '    bundleID="%s"\n' % bundle)
+                return subprocess.CompletedProcess(argv, 0, out, "")
+            return run
+        for bundle, want in (("dev.warp.Warp-Stable", True),
+                             ("dev.warp.Warp-Preview", True),
+                             ("com.apple.finder", False),
+                             ("com.example.dev.warp.fake", False),
+                             (None, None)):
+            subprocess.run = run_with(bundle)
+            assert warp_in_front() is want, (bundle, warp_in_front())
+        subprocess.run = saved[3]
+
+        time.sleep = lambda _s: None
+        calls = []
+        globals()["_call"] = lambda m, p: calls.append(
+            (m, p, os.environ.get("HERDR_SOCKET_PATH"))) or {"result": {}}
+
+        # Away, away, back -> focus it once, over the socket the *file* names
+        # (a waiter started by another herdr session must not use its own).
+        os.environ["HERDR_SOCKET_PATH"] = "/tmp/herdr-a.sock"
+        fronts = iter([False, False, True])
+        globals()["warp_in_front"] = lambda: next(fronts)
+        put("w7:p5")
+        _wait_and_jump(d)
+        assert calls == [("pane.focus", {"pane_id": "w7:p5"},
+                          "/tmp/herdr-b.sock")], calls
+        assert not os.path.exists(target)
+
+        # A socket path with a space survives the round trip.
+        del calls[:]
+        globals()["warp_in_front"] = lambda: True
+        put("w1:p1", "/tmp/my herdr/h.sock")
+        _wait_and_jump(d)
+        assert calls[0][2] == "/tmp/my herdr/h.sock", calls
+
+        # Expired -> drop the target without jumping, even if Warp is in front.
+        del calls[:]
+        put("w7:p5", age=JUMP_WAIT_SECONDS + 1)
+        _wait_and_jump(d)
+        assert calls == [] and not os.path.exists(target), calls
+
+        # The window is the target's own age, not the waiter's: a waiter
+        # started long ago still jumps to a target written a minute before
+        # the window closes.
+        fronts = iter([False, True])
+        globals()["warp_in_front"] = lambda: next(fronts)
+        put("w2:p2", age=JUMP_WAIT_SECONDS - 60)
+        _wait_and_jump(d)
+        assert [c[1] for c in calls] == [{"pane_id": "w2:p2"}], calls
+
+        # Never back -> the loop ends by the clock, not by running forever.
+        del calls[:]
+        now = [time.time()]
+        real_time = time.time
+        time.time = lambda: now[0]
+        globals()["warp_in_front"] = lambda: False
+        time.sleep = lambda s: now.__setitem__(0, now[0] + s)
+        put("w7:p5")
+        os.utime(target, (now[0], now[0]))
+        _wait_and_jump(d)
+        time.time = real_time
+        time.sleep = lambda _s: None
+        assert calls == [] and not os.path.exists(target), calls
+
+        # A malformed target is dropped, not sent.
+        globals()["warp_in_front"] = lambda: True
+        with open(target, "w") as fh:
+            fh.write("only-one-line")
+        _wait_and_jump(d)
+        assert calls == [], calls
+
+        # A waiter already holds the lock -> leave the target to it.
+        put("w7:p5")
+        held = open(os.path.join(d, "jump.lock"), "w")
+        fcntl.flock(held, fcntl.LOCK_EX)
+        _wait_and_jump(d)
+        held.close()
+        assert calls == [] and os.path.exists(target), calls
+        os.remove(target)
+
+        # Guards: nothing is written and nothing forks unless Warp is known to
+        # be in the background and there is somewhere to jump.
+        os.environ["HERDR_PLUGIN_STATE_DIR"] = d
+        for front, pane, sock in ((True, "w7:p5", "/s"),     # Warp in front
+                                  (None, "w7:p5", "/s"),     # no lsappinfo
+                                  (False, None, "/s"),       # no pane id
+                                  (False, "w7:p5", None)):   # no socket
+            globals()["warp_in_front"] = lambda f=front: f
+            if sock:
+                os.environ["HERDR_SOCKET_PATH"] = sock
+            else:
+                os.environ.pop("HERDR_SOCKET_PATH", None)
+            assert arm_jump(pane) is False, (front, pane, sock)
+            assert not os.path.exists(target), (front, pane, sock)
+
+        # main() arms only when the desktop notification actually went out,
+        # and with the event's own pane.
+        armed = []
+        real = (emit, locate, toast, arm_jump)
+        g = globals()
+        g["locate"] = lambda p, w: ("ws", "", "", False)
+        g["toast"] = lambda t, b: None
+        g["arm_jump"] = lambda p: armed.append(p) or True
+        os.environ["HERDR_PLUGIN_EVENT_JSON"] = json.dumps(
+            {"agent_status": "done", "agent": "claude", "pane_id": "w3:p4",
+             "workspace_id": "w3"})
+        for sent, want in ((1, ["w3:p4"]), (0, [])):
+            del armed[:]
+            g["emit"] = lambda t, b, n=sent: n
+            main()
+            assert armed == want, (sent, armed)
+        os.environ["HERDR_PLUGIN_EVENT_JSON"] = '{"agent_status":"working"}'
+        del armed[:]
+        g["emit"] = lambda t, b: 1
+        main()
+        assert armed == [], armed
+        g["emit"], g["locate"], g["toast"], g["arm_jump"] = real
+
+        # The real thing: fork a detached waiter and watch it call a fake herdr
+        # server. Warp is "away" when armed and "back" on the waiter's first
+        # look -- the child inherits this counter, so both sides agree.
+        globals()["_call"] = saved[0]
+        time.sleep = saved[1]
+        sock = os.path.join(tempfile.mkdtemp(), "h.sock")
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(sock)
+        server.listen(1)
+        server.settimeout(5)
+        got = []
+
+        def serve():
+            try:
+                conn, _ = server.accept()
+                got.append(json.loads(conn.makefile().readline()))
+                conn.sendall(b'{"id":"x","result":{}}\n')
+                conn.close()
+            except OSError:
+                pass
+        th = threading.Thread(target=serve)
+        th.start()
+        looks = [0]
+
+        def front():
+            looks[0] += 1
+            return looks[0] > 1
+        globals()["warp_in_front"] = front
+        os.environ["HERDR_SOCKET_PATH"] = sock
+        started = time.time()
+        assert arm_jump("w9:p1") is True
+        assert time.time() - started < 1, "the hook must not wait for the click"
+        th.join(10)
+        server.close()
+        assert got and got[0]["method"] == "pane.focus", got
+        assert got[0]["params"] == {"pane_id": "w9:p1"}, got
+        for _ in range(50):             # the waiter clears it after the call
+            if not os.path.exists(target):
+                break
+            time.sleep(0.05)
+        assert not os.path.exists(target)
+    finally:
+        (globals()["_call"], time.sleep, globals()["warp_in_front"],
+         subprocess.run, env) = saved
+        os.environ.clear()
+        os.environ.update(env)
 
 
 def self_check():
@@ -521,6 +822,8 @@ def self_check():
         os.environ.pop("XDG_CONFIG_HOME", None)
         if home:
             os.environ["XDG_CONFIG_HOME"] = home
+    check_jump()
+
     # A bare payload still works.
     assert unwrap('{"agent_status":"idle"}')["agent_status"] == "idle"
     assert unwrap("not json") is None
