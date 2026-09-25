@@ -1,3 +1,10 @@
+# [0.3.0](https://github.com/ProjectAJ14/herdr-warp/compare/v0.2.1...v0.3.0) (2026-09-25)
+
+
+### Features
+
+* clicking a notification jumps to the pane that raised it ([65e9b89](https://github.com/ProjectAJ14/herdr-warp/commit/65e9b8968ebd5847cccc01480df8657cf4636014))
+
 ## [0.2.1](https://github.com/ProjectAJ14/herdr-warp/compare/v0.2.0...v0.2.1) (2026-09-20)
 
 
