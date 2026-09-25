@@ -88,8 +88,9 @@ One event hook, one script.
 
 The one thing to notice: **Warp sees a single PTY for the whole Herdr session**,
 no matter how many panes and agents run behind it. That single fact drives two
-design choices — a plain `notify` rather than the structured protocol, and the
-click-targeting limit. Both are explained under [Corner cases](#corner-cases).
+design choices: a plain `notify` rather than the structured protocol, and
+click-to-jump done from the plugin side rather than by Warp. Both are explained
+under [Corner cases](#corner-cases).
 
 `notify.py` locates the herdr client process and writes to its tty. It does *not*
 fall back to its own process ancestry: inside a pane that resolves to the pane's
@@ -282,25 +283,54 @@ and it stays until you dismiss it.
 
 ### Clicking the notification should land me on the right pane
 
-**Partly. Two keystrokes, not one — and this is a hard limit, not an oversight.**
+**Covered, on macOS.** Click the notification and you land on the pane that
+raised it: right workspace, right tab, right pane.
 
-Warp sees a single PTY for the herdr client, no matter how many panes and agents
-Herdr runs behind it. So a notification click can only reach *the Warp tab
-running Herdr*; Warp has no concept of the herdr pane inside it. This is why the
-plugin sends a plain `notify` rather than Warp's structured `warp://cli-agent`
-protocol — the structured protocol keys on a session id, and with N agents
-sharing one Warp pane it would only make the tab status flap, without buying any
-click targeting.
+Warp itself cannot do this. Its notification click has no callback and only
+brings Warp forward. Warp sees one PTY for the whole herdr client, so it has no
+idea which herdr pane you meant. The plugin watches for the result of the
+click instead:
 
-What does work:
+1. When it sends the desktop notification while Warp is in the background, it
+   records the pane id and starts one small detached waiter.
+2. The waiter checks the frontmost app every 0.3 s (`lsappinfo`, no
+   permissions needed).
+3. When Warp comes to the front, it calls Herdr's `pane.focus`, which switches
+   workspace, tab and pane in one go, then exits.
 
-1. Click the notification → Warp comes forward on the Herdr tab.
-2. Press **`prefix`+`o`** (`ctrl+b o` with your prefix) → Herdr's
-   `open_notification_target` jumps to the pane that raised the notification.
+What that means in practice:
 
-To make step 2 optional, the body names its own destination — `workspace › tab ›
-task`, so one glance tells you which space and which pane to switch to. See
-[How it works](#how-it-works) for the shape and the hops it drops.
+- **Any return to Warp counts**, not only a click on the notification. Coming
+  back with ⌘-Tab while an agent is waiting on you also lands you on it. That is
+  deliberate: the waiter cannot tell the two apart, and landing on the agent
+  that called you is usually what you want either way.
+- **The latest notification wins.** If three agents finish while you are away,
+  you land on the last one, whichever banner you click. The body still names
+  each one's `workspace › tab › task`, and **`prefix`+`o`** (Herdr's
+  `open_notification_target`) is still there for the others.
+- **One jump per trip away.** It fires once and clears. If Warp was already in
+  front when the agent finished, Warp shows no desktop notification, so nothing
+  is armed and nothing moves under you.
+- **It expires 30 minutes after the latest notification.** Each new one
+  restarts the clock, so coming back hours later does not move you to
+  something stale.
+- **Several herdr sessions are fine.** The target records which session's
+  socket it came from, so the jump happens in the session that notified.
+- **A closed pane is skipped.** `pane.focus` reports `pane_not_found` and the
+  waiter exits.
+- **Linux:** there is no `lsappinfo`, so nothing is armed and you still get the
+  notification. Use `prefix`+`o` there.
+
+Two knobs at the top of `notify.py`:
+
+```python
+JUMP_WAIT_SECONDS = 1800   # how long a notification stays clickable; 0 = off
+JUMP_POLL_SECONDS = 0.3    # how quickly the jump follows the click
+```
+
+The plugin still sends a plain `notify` rather than Warp's structured
+`warp://cli-agent` protocol. The structured protocol keys on a session id, and
+with N agents sharing one Warp pane it would only make the tab status flap.
 
 ## Releases
 
@@ -343,6 +373,10 @@ repo, and it stays stdlib-only python.
   the top of `notify.py` (`STATES`) — edit it if you want `idle` too.
 - Holding the on-screen popup open keeps the hook process alive for ~3 s. Herdr
   spawns hooks detached, so this does not block the server or the event loop.
+- Click-to-jump leaves one detached waiter per trip away from Warp (`fork` +
+  `setsid`, stdio on `/dev/null`). It exits on the jump or after
+  `JUMP_WAIT_SECONDS`. Its state is `jump` and `jump.lock` in the plugin state
+  dir.
 
 ## Troubleshooting
 
@@ -360,8 +394,9 @@ Herdr passes both `HERDR_PLUGIN_CONFIG_DIR` and `HERDR_PLUGIN_STATE_DIR`, and
 which one a hook run sees is not guaranteed, so flag both. The log lands next to
 whichever flag is found.
 
-Each line records the raw event Herdr passed in and how many ttys were written
-to. Delete the `debug` file to turn it back off.
+Each line records the raw event Herdr passed in, how many ttys were written
+to, whether a click-to-jump was armed, and later `jumped to <pane>: ok` when
+it fires. Delete the `debug` file to turn it back off.
 
 If it never fires, confirm the hook is registered:
 
