@@ -1,3 +1,10 @@
+# [0.4.0](https://github.com/ProjectAJ14/herdr-warp/compare/v0.3.0...v0.4.0) (2026-10-04)
+
+
+### Features
+
+* clicking a notification lands on its own pane via terminal-notifier ([f37ae0b](https://github.com/ProjectAJ14/herdr-warp/commit/f37ae0b29d52f479c2ddbff92800335aa5779c42))
+
 # [0.3.0](https://github.com/ProjectAJ14/herdr-warp/compare/v0.2.1...v0.3.0) (2026-09-25)
 
 
