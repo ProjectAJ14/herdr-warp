@@ -165,6 +165,32 @@ but its event hooks are not wired until the next server start. See
 Requires Herdr ≥ 0.8.0, Warp, and `python3` (Herdr's own Claude integration
 already depends on python3). No `jq`, no other dependencies.
 
+### Optional: per-notification click with terminal-notifier (macOS)
+
+With Warp's own banner, clicking lands on the pane of the *latest*
+notification (see [Clicking the notification](#clicking-the-notification-should-land-me-on-the-right-pane)).
+Install [`terminal-notifier`](https://github.com/julienXX/terminal-notifier)
+and every banner lands on **its own** pane instead — in any terminal that runs
+Herdr (Warp, Ghostty, iTerm…), not just Warp:
+
+```bash
+brew install terminal-notifier
+# macOS only lists it under Notifications after it has run once:
+open "$(brew --prefix terminal-notifier)/terminal-notifier.app"
+```
+
+Then allow it in **System Settings › Notifications › terminal-notifier**
+(pick **Alerts** there if you want banners to stay until dismissed). The
+plugin picks it up on the next event, from `PATH`, `/opt/homebrew/bin` or
+`/usr/local/bin` — no restart, no config. Uninstall it and you are back on the
+Warp route.
+
+Set `[ui.toast] delivery = "herdr"` (or `"off"`) with this route. Under
+`"terminal"` Herdr writes its own OSC 9/99 to the outer terminal; Warp ignores
+those, but Ghostty and iTerm draw them, so you would get Herdr's banner as well
+as this one. The plugin cannot suppress Herdr's, so it only logs a note to the
+[debug log](#troubleshooting).
+
 For local development instead:
 
 ```bash
@@ -183,13 +209,15 @@ HERDR_SOCKET_PATH=~/.config/herdr/herdr.sock \
 ```
 
 ```
-osc 777 -> 1 client tty(s): ['/dev/ttys000']
+osc -> 1 sent, client tty(s): ['/dev/ttys000']
 herdr toast (delivery=herdr): shown
 ```
 
-The first line is the Warp desktop notification: for that one, **switch away from
-Warp** — Warp raises it only while it is *not* the focused app, so a test run with
-Warp in front looks like a silent failure. `0` ttys means no Herdr client is
+The first line is the desktop notification and the route it took — `osc` for
+Warp's own banner, `terminal-notifier` when that is installed. Either way,
+**switch away from the terminal** — the banner is raised only while it is
+*not* the focused app, so a test run with it in front looks like a silent
+failure (`terminal-notifier -> 0 sent`). `0` ttys means no Herdr client is
 attached, so there is no outer terminal to notify.
 
 The second line is the on-screen popup. `skipped` means `[ui.toast] delivery` is
@@ -213,6 +241,12 @@ the focused app** — so no system notification ever fires while you are looking
 at it. That is why this plugin does not try to detect focus itself: Warp is
 already the right gate, and it is the only component that knows.
 
+The terminal-notifier route has no such gate, so the plugin does it: it walks
+up from the herdr client to the `.app` it runs under (Warp, Ghostty, …), reads
+its bundle id, and posts only when `lsappinfo` says a *different* app is in
+front. If it cannot tell — the host is not a `.app`, or `lsappinfo` fails — it
+does not guess: it takes the Warp route for that event instead.
+
 ### When Warp is visible, show it on the current screen instead
 
 **Needs one config line from you.** Herdr's in-app toast is its own feature, and
@@ -227,7 +261,9 @@ delivery = "herdr"      # in-app toast  <- required for the on-screen popup
 With `delivery = "terminal"` you get **neither** on-screen: Warp cannot read
 Herdr's OSC 9, and Herdr suppresses its own in-app toast because it thinks the
 terminal is handling it. (The Warp desktop notification is unaffected either
-way — this plugin writes OSC 777 itself and does not go through `delivery`.)
+way — this plugin writes OSC 777 itself and does not go through `delivery`.
+With terminal-notifier, avoid `"terminal"` — see
+[the optional install step](#optional-per-notification-click-with-terminal-notifier-macos).)
 
 Under `delivery = "herdr"` the on-screen popup is split by workspace, because
 Herdr toasts **background** workspaces itself and only those:
@@ -246,6 +282,7 @@ background ones, drop the `if focused` guard on the `toast(...)` call in
 |---|---|---|
 | the Herdr UI in Warp | in-app toast, positioned by `[ui.toast.herdr] position` | Herdr, drawn in the active theme |
 | another app | Warp desktop notification | this plugin (OSC 777) |
+| another app, terminal-notifier installed | one terminal-notifier banner | this plugin |
 
 #### How long the on-screen popup stays up
 
@@ -278,13 +315,45 @@ drift between versions; if the seam starts to flicker, lower it. Each cycle
 costs ~7 `notification.show` calls, which show up in `herdr-server.log`.
 
 For the **desktop** notification the dwell time is macOS's, not ours: set Warp
-to **Alerts** instead of **Banners** in System Settings › Notifications › Warp
-and it stays until you dismiss it.
+(or terminal-notifier) to **Alerts** instead of **Banners** in System Settings ›
+Notifications and it stays until you dismiss it.
 
 ### Clicking the notification should land me on the right pane
 
 **Covered, on macOS.** Click the notification and you land on the pane that
-raised it: right workspace, right tab, right pane.
+raised it: right workspace, right tab, right pane. There are two routes:
+
+| | Warp banner (default) | terminal-notifier ([optional](#optional-per-notification-click-with-terminal-notifier-macos)) |
+|---|---|---|
+| Three banners out, you click the first | lands on the **latest** pane | lands on **that banner's** pane |
+| Coming back with ⌘-Tab | also jumps | does not jump — only a click does |
+| Terminal | Warp | any `.app` terminal (Warp, Ghostty, iTerm…) |
+| Expires | 30 min after the latest | never; the banner sits in Notification Center |
+
+#### With terminal-notifier
+
+Each banner carries its own click action:
+`python3 notify.py --jump <socket> <pane>`, which calls Herdr's `pane.focus`
+over that session's socket, and `-activate` brings your terminal forward. No
+waiter, nothing armed. To keep it to one banner per event:
+
+- **Nothing is written to the terminal** on this route — an OSC 777 as well
+  would make Warp or Ghostty raise a second banner.
+- **One banner per event**, however many herdr clients are attached.
+- **One banner per pane.** A newer banner for the same pane replaces the older
+  one (`-group`), so an agent that blocks twice does not stack up.
+- **Nothing while the terminal is in front** — see
+  [When Warp is visible](#when-warp-is-visible-dont-send-a-system-notification).
+- **Fallback.** If terminal-notifier exits non-zero or is gone, or the focus
+  check cannot tell what is in front, that event goes out as a Warp banner
+  instead, with the latest-wins jump below. A terminal-notifier that hangs past
+  5 s is *not* followed by a Warp banner: it has most likely posted already, and
+  a second banner is worse than a late one.
+
+A banner clicked after its pane was closed does nothing (`pane_not_found` in
+the [debug log](#troubleshooting)).
+
+#### With Warp's own banner
 
 Warp itself cannot do this. Its notification click has no callback and only
 brings Warp forward. Warp sees one PTY for the whole herdr client, so it has no
@@ -307,7 +376,8 @@ What that means in practice:
 - **The latest notification wins.** If three agents finish while you are away,
   you land on the last one, whichever banner you click. The body still names
   each one's `workspace › tab › task`, and **`prefix`+`o`** (Herdr's
-  `open_notification_target`) is still there for the others.
+  `open_notification_target`) is still there for the others — or install
+  terminal-notifier, above.
 - **One jump per trip away.** It fires once and clears. If Warp was already in
   front when the agent finished, Warp shows no desktop notification, so nothing
   is armed and nothing moves under you.
@@ -376,7 +446,7 @@ repo, and it stays stdlib-only python.
 - Click-to-jump leaves one detached waiter per trip away from Warp (`fork` +
   `setsid`, stdio on `/dev/null`). It exits on the jump or after
   `JUMP_WAIT_SECONDS`. Its state is `jump` and `jump.lock` in the plugin state
-  dir.
+  dir. The terminal-notifier route starts no waiter.
 
 ## Troubleshooting
 
@@ -394,9 +464,10 @@ Herdr passes both `HERDR_PLUGIN_CONFIG_DIR` and `HERDR_PLUGIN_STATE_DIR`, and
 which one a hook run sees is not guaranteed, so flag both. The log lands next to
 whichever flag is found.
 
-Each line records the raw event Herdr passed in, how many ttys were written
-to, whether a click-to-jump was armed, and later `jumped to <pane>: ok` when
-it fires. Delete the `debug` file to turn it back off.
+Each line records the raw event Herdr passed in, the route (`osc` or
+`terminal-notifier`) and how many ttys or banners it sent, whether a
+click-to-jump was armed, and later `jumped to <pane>: ok` when it fires —
+from the waiter, or from a clicked terminal-notifier banner. Delete the `debug` file to turn it back off.
 
 If it never fires, confirm the hook is registered:
 
