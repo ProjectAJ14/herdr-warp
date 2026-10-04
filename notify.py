@@ -27,6 +27,14 @@ held open for about twice Herdr's own dwell -- see the knobs below.
 
 Clicking the desktop notification lands on the pane that raised it: a detached
 waiter sees Warp come back to the front and calls `pane.focus` (macOS only).
+Warp's banner has no click callback, so with several banners out the latest
+one wins.
+
+With `terminal-notifier` installed (macOS), the desktop notification is posted
+by it instead, and each banner's click runs `notify.py --jump` for its *own*
+pane. That route writes no OSC to the terminal (or Warp/Ghostty would raise a
+second banner), arms no waiter (it would race the click), and does its own
+focus gate, since terminal-notifier has none. Any failure falls back to OSC 777.
 
 Run `python3 notify.py --self-check` for the offline assertions, or
 `python3 notify.py --test` to fire one real notification.
@@ -34,6 +42,9 @@ Run `python3 notify.py --self-check` for the offline assertions, or
 
 import json
 import os
+import plistlib
+import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -75,6 +86,10 @@ JUMP_WAIT_SECONDS = 1800
 JUMP_POLL_SECONDS = 0.3
 WARP_BUNDLE_PREFIX = "dev.warp."
 
+# The terminal-notifier route. Herdr's hook PATH can be minimal, so look where
+# Homebrew puts it too. Uninstall it to go back to the Warp route.
+NOTIFIER_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
+
 # `herdr session attach <name>` is the only client form that leads with a word.
 CLIENT_SUBCOMMANDS = ("session",)
 
@@ -99,13 +114,33 @@ def osc777(title, body):
     return "\033]777;notify;%s;%s\007" % (title, body)
 
 
-def _ps(fmt, pid):
-    try:
-        out = subprocess.run(["ps", "-o", fmt, "-p", str(pid)],
-                             capture_output=True, text=True, timeout=3).stdout
-    except (OSError, subprocess.SubprocessError):
-        return []
-    return out.split()
+def host_bundle(pid):
+    """CFBundleIdentifier of the .app the herdr client `pid` runs under, or None.
+
+    Walks parent pids until an executable inside `X.app/Contents/MacOS/` --
+    measured: herdr -> -zsh -> /Applications/Warp.app/Contents/MacOS/stable.
+    """
+    for _ in range(64):
+        try:
+            out = subprocess.run(["ps", "-o", "ppid=,comm=", "-p", str(pid)],
+                                 capture_output=True, text=True,
+                                 timeout=3).stdout.strip()
+            ppid, comm = out.split(None, 1)     # comm may contain spaces
+            ppid = int(ppid)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
+        if ".app/Contents/MacOS/" in comm:
+            app = comm.split(".app/Contents/MacOS/", 1)[0] + ".app"
+            try:
+                with open(os.path.join(app, "Contents", "Info.plist"),
+                          "rb") as fh:
+                    return plistlib.load(fh).get("CFBundleIdentifier")
+            except Exception:
+                return None
+        if ppid <= 1:
+            return None
+        pid = ppid
+    return None
 
 
 def _is_client_argv(argv, binname):
@@ -124,8 +159,9 @@ def _is_client_argv(argv, binname):
     return argv[1].startswith("-") or argv[1] in CLIENT_SUBCOMMANDS
 
 
-def client_ttys():
-    """Ttys of the herdr client(s) -- the outer terminal, i.e. the one Warp owns.
+def clients():
+    """[(pid, tty)] of the herdr client(s) -- the outer terminal, i.e. the one
+    Warp owns.
 
     Found by locating the herdr client process. Empty when no client is
     attached -- e.g. a detached session, or between a live handoff and a
@@ -134,27 +170,32 @@ def client_ttys():
     binname = os.path.basename(os.environ.get("HERDR_BIN_PATH") or "herdr")
     found = []
     try:
-        out = subprocess.run(["ps", "-eo", "tty=,args="],
+        out = subprocess.run(["ps", "-eo", "pid=,tty=,args="],
                              capture_output=True, text=True, timeout=3).stdout
     except (OSError, subprocess.SubprocessError):
         out = ""
     for line in out.splitlines():
-        parts = line.split(None, 1)
-        if len(parts) != 2:
+        parts = line.split(None, 2)
+        if len(parts) != 3:
             continue
-        tty, args = parts
+        pid, tty, args = parts
         if tty in ("??", "-", "?"):
             continue
         if _is_client_argv(args.split(), binname):
-            dev = "/dev/" + tty
-            if dev not in found:
-                found.append(dev)
-    # ponytail: notifies every attached client. Fine for one Warp window; if you
-    # attach several, filter by tty here.
-    #
+            found.append((pid, "/dev/" + tty))
     # No client attached -> no outer terminal to notify, so return nothing. Do
     # NOT fall back to walking our own ancestry: that resolves to a
     # herdr-managed *pane* PTY, and herdr swallows OSC 777 arriving from panes.
+    return found
+
+
+def client_ttys():
+    # ponytail: notifies every attached client. Fine for one Warp window; if you
+    # attach several, filter by tty here.
+    found = []
+    for _pid, dev in clients():
+        if dev not in found:
+            found.append(dev)
     return found
 
 
@@ -262,8 +303,8 @@ def toast(title, body):
     return reason
 
 
-def warp_in_front():
-    """True/False on macOS; None where there is no `lsappinfo` to ask."""
+def front_bundle():
+    """Bundle id of the frontmost app ("" if none); None without `lsappinfo`."""
     try:
         asn = subprocess.run(["lsappinfo", "front"], capture_output=True,
                              text=True, timeout=3).stdout.strip()
@@ -271,7 +312,90 @@ def warp_in_front():
                               capture_output=True, text=True, timeout=3).stdout
     except (OSError, subprocess.SubprocessError):
         return None
-    return ('"%s' % WARP_BUNDLE_PREFIX) in info
+    # `"CFBundleIdentifier"="dev.warp.Warp-Stable"`
+    return info.rsplit("=", 1)[-1].strip().strip('"') if "=" in info else ""
+
+
+def warp_in_front():
+    """True/False on macOS; None where there is no `lsappinfo` to ask."""
+    front = front_bundle()
+    return None if front is None else front.startswith(WARP_BUNDLE_PREFIX)
+
+
+def notifier():
+    """Path to terminal-notifier on macOS, else None (-> the Warp route)."""
+    if sys.platform != "darwin":
+        return None
+    return (shutil.which("terminal-notifier")
+            or shutil.which("terminal-notifier",
+                            path=os.pathsep.join(NOTIFIER_DIRS)))
+
+
+def notifier_argv(tn, title, body, pane_id, host):
+    """One banner, grouped per pane, whose click focuses that pane."""
+    sock = os.environ.get("HERDR_SOCKET_PATH") or ""
+    # -group: a newer banner for the same pane replaces the older one. The
+    # socket is in it because pane ids repeat across herdr sessions.
+    # A message leading with "-" or "[" is taken for an option and the post
+    # fails (exit 2, measured); a backslash is terminal-notifier's own escape.
+    if body[:1] in ("-", "["):
+        body = "\\" + body
+    argv = [tn, "-title", title, "-message", body,
+            "-group", "herdr-warp:%s:%s" % (sock, pane_id), "-activate", host]
+    if sock and pane_id:
+        # The click runs this through a shell, without Herdr's env, so the
+        # plugin dirs ride along for trace().
+        env = ["%s=%s" % (k, shlex.quote(os.environ[k]))
+               for k in ("HERDR_PLUGIN_STATE_DIR", "HERDR_PLUGIN_CONFIG_DIR")
+               if os.environ.get(k)]
+        # The PATH python3, not sys.executable: Homebrew's is a versioned
+        # Cellar path that an upgrade deletes under banners still on screen.
+        cmd = [shutil.which("python3") or sys.executable or "python3",
+               os.path.abspath(__file__),
+               "--jump", sock, pane_id]
+        argv += ["-execute", " ".join(env + [shlex.quote(a) for a in cmd])]
+    return argv
+
+
+def deliver(title, body, pane_id):
+    """The desktop notification. Returns (route, banners/ttys sent).
+
+    terminal-notifier when it is installed and the host terminal is known to
+    be in the background; nothing when the host is in front (terminal-notifier
+    has no focus gate of its own, Warp does); OSC 777 for everything else --
+    not installed, host or frontmost app unknown, or terminal-notifier failed.
+    """
+    attached = clients()
+    tn = notifier() if attached else None
+    # ponytail: the first client picks the host app. Several clients in
+    # different terminals would all activate that one.
+    host = host_bundle(attached[0][0]) if tn else None
+    front = front_bundle() if host else None
+    if host and front is not None:
+        if front == host:
+            return "terminal-notifier", 0   # you are looking at it
+        if toast_delivery() in ("terminal", "system"):
+            trace("delivery=%s: Herdr may raise its own banner as well"
+                  % toast_delivery())
+        try:
+            # Exits as soon as the banner is posted; the click is handled by
+            # terminal-notifier's own app later, not by this process.
+            done = subprocess.run(notifier_argv(tn, title, body, pane_id, host),
+                                  stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL, timeout=5,
+                                  start_new_session=True)
+            if done.returncode == 0:
+                return "terminal-notifier", 1
+        except subprocess.TimeoutExpired:
+            # It posts before it could hang, so falling back here would be the
+            # second banner. Missing one beats doubling one.
+            trace("terminal-notifier timed out; not falling back")
+            return "terminal-notifier", 1
+        except (OSError, subprocess.SubprocessError):
+            pass
+        trace("terminal-notifier failed, falling back to OSC 777")
+    return "osc", emit(title, body)
 
 
 def _state_dir():
@@ -349,6 +473,12 @@ def _wait_and_jump(d):
         os.remove(target)
     except (OSError, ValueError):
         return
+    jump(sock, pane_id)
+
+
+def jump(sock, pane_id):
+    """`pane.focus` over `sock`. Also `notify.py --jump SOCK PANE`, which is
+    what a terminal-notifier banner runs when clicked."""
     os.environ["HERDR_SOCKET_PATH"] = sock
     reply = _call("pane.focus", {"pane_id": pane_id})
     trace("jumped to %s: %s"
@@ -359,7 +489,8 @@ def locate(pane_id, workspace_id):
     """(workspace label, tab label, pane title, workspace is focused).
 
     Warp sees one PTY for every herdr pane, so its notification click only
-    reaches the herdr tab; arm_jump() does the rest for the latest one. Naming
+    reaches the herdr tab; arm_jump() does the rest for the latest one (each
+    terminal-notifier banner jumps for itself). Naming
     the workspace and tab in the body covers the others, as does Herdr's own
     `prefix+o` (open_notification_target).
 
@@ -479,14 +610,16 @@ def main():
     ws_label, tab_label, pane_title, focused = locate(event.get("pane_id"),
                                                       event.get("workspace_id"))
     title, body = compose(event, ws_label, tab_label, pane_title)
-    sent = emit(title, body)
-    armed = sent and arm_jump(event.get("pane_id"))
+    route, sent = deliver(title, body, event.get("pane_id"))
+    # A terminal-notifier banner jumps on its own click; a waiter would race it
+    # and land on the latest pane instead.
+    armed = sent and route == "osc" and arm_jump(event.get("pane_id"))
     # Herdr already toasts background workspaces (with its own sparser text);
     # ours covers the workspace you are looking at, which Herdr deliberately
     # skips. Split that way, one event never produces two toasts.
     reason = toast(title, body) if focused else None
-    trace("notified %d tty(s), toast=%s, jump=%s: %s | %s"
-          % (sent, reason or "skipped", "armed" if armed else "no",
+    trace("notified %d via %s, toast=%s, jump=%s: %s | %s"
+          % (sent, route, reason or "skipped", "armed" if armed else "no",
              title, body))
     return 0
 
@@ -616,8 +749,9 @@ def check_jump():
 
         # main() arms only when the desktop notification actually went out,
         # and with the event's own pane.
+        # A terminal-notifier banner jumps on its own click: never arm there.
         armed = []
-        real = (emit, locate, toast, arm_jump)
+        real = (deliver, locate, toast, arm_jump)
         g = globals()
         g["locate"] = lambda p, w: ("ws", "", "", False)
         g["toast"] = lambda t, b: None
@@ -625,17 +759,19 @@ def check_jump():
         os.environ["HERDR_PLUGIN_EVENT_JSON"] = json.dumps(
             {"agent_status": "done", "agent": "claude", "pane_id": "w3:p4",
              "workspace_id": "w3"})
-        for sent, want in ((1, ["w3:p4"]), (0, [])):
+        for route, sent, want in (("osc", 1, ["w3:p4"]), ("osc", 0, []),
+                                  ("terminal-notifier", 1, []),
+                                  ("terminal-notifier", 0, [])):
             del armed[:]
-            g["emit"] = lambda t, b, n=sent: n
+            g["deliver"] = lambda t, b, p, r=route, n=sent: (r, n)
             main()
-            assert armed == want, (sent, armed)
+            assert armed == want, (route, sent, armed)
         os.environ["HERDR_PLUGIN_EVENT_JSON"] = '{"agent_status":"working"}'
         del armed[:]
-        g["emit"] = lambda t, b: 1
+        g["deliver"] = lambda t, b, p: ("osc", 1)
         main()
         assert armed == [], armed
-        g["emit"], g["locate"], g["toast"], g["arm_jump"] = real
+        g["deliver"], g["locate"], g["toast"], g["arm_jump"] = real
 
         # The real thing: fork a detached waiter and watch it call a fake herdr
         # server. Warp is "away" when armed and "back" on the waiter's first
@@ -683,6 +819,154 @@ def check_jump():
          subprocess.run, env) = saved
         os.environ.clear()
         os.environ.update(env)
+
+
+def check_notifier():
+    """The terminal-notifier route: route choice, the no-duplicate rules, the
+    click command, host detection and the fallback. Part of --self-check;
+    every subprocess is faked, so no banner is ever posted."""
+    import tempfile
+
+    g = globals()
+    saved = (dict(g), subprocess.run, shutil.which, sys.platform,
+             dict(os.environ))
+    try:
+        # Route choice: macOS only, PATH first, then where Homebrew puts it.
+        def which(found):
+            return lambda name, path=None: (
+                found.get(path) if name == "terminal-notifier" else None)
+        sys.platform = "darwin"
+        shutil.which = which({None: "/x/terminal-notifier"})
+        assert notifier() == "/x/terminal-notifier"
+        shutil.which = which({os.pathsep.join(NOTIFIER_DIRS): "/opt/tn"})
+        assert notifier() == "/opt/tn"
+        shutil.which = which({})
+        assert notifier() is None
+        sys.platform = "linux"
+        shutil.which = which({None: "/x/terminal-notifier"})
+        assert notifier() is None
+        sys.platform, shutil.which = saved[3], saved[2]
+
+        # The frontmost bundle, parsed from the real `lsappinfo` shape.
+        def lsappinfo(out):
+            return lambda argv, **_kw: subprocess.CompletedProcess(
+                argv, 0, "ASN:0x0-0x1:" if argv[1] == "front" else out, "")
+        subprocess.run = lsappinfo('"CFBundleIdentifier"="dev.warp.Warp-Stable"\n')
+        assert front_bundle() == "dev.warp.Warp-Stable", front_bundle()
+        subprocess.run = lsappinfo("")
+        assert front_bundle() == ""
+
+        # Host detection: herdr -> shell -> an .app executable, path with a
+        # space, read off a fake Info.plist.
+        app = os.path.join(tempfile.mkdtemp(), "My Term.app")
+        os.makedirs(os.path.join(app, "Contents", "MacOS"))
+        with open(os.path.join(app, "Contents", "Info.plist"), "wb") as fh:
+            plistlib.dump({"CFBundleIdentifier": "com.example.term"}, fh)
+        tree = {"100": " 99 herdr\n", "99": " 98 -zsh\n",
+                "98": " 1 %s/Contents/MacOS/term\n" % app,
+                "50": " 1 /sbin/launchd\n"}
+
+        def ps(argv, **_kw):
+            return subprocess.CompletedProcess(argv, 0, tree.get(argv[-1], ""),
+                                               "")
+        subprocess.run = ps
+        assert host_bundle("100") == "com.example.term", host_bundle("100")
+        assert host_bundle("50") is None         # reached launchd, no .app
+        assert host_bundle("7") is None          # gone / ps says nothing
+        subprocess.run = saved[1]
+
+        # The click command: -group per pane, -activate the host, and an
+        # -execute that survives a shell even with a space in the socket path.
+        os.environ["HERDR_SOCKET_PATH"] = "/tmp/my herdr/h.sock"
+        os.environ["HERDR_PLUGIN_STATE_DIR"] = "/tmp/st ate"
+        os.environ.pop("HERDR_PLUGIN_CONFIG_DIR", None)
+        argv = notifier_argv("tn", "T", "B", "w1:p1", "com.example.term")
+        opt = dict(zip(argv[1::2], argv[2::2]))
+        assert opt["-title"] == "T" and opt["-message"] == "B", argv
+        assert opt["-group"] == "herdr-warp:/tmp/my herdr/h.sock:w1:p1", argv
+        assert opt["-activate"] == "com.example.term", argv
+        assert shlex.split(opt["-execute"]) == [
+            "HERDR_PLUGIN_STATE_DIR=/tmp/st ate",
+            shutil.which("python3") or sys.executable,
+            os.path.abspath(__file__), "--jump", "/tmp/my herdr/h.sock",
+            "w1:p1"], opt["-execute"]
+        # A leading "-" or "[" is escaped, or terminal-notifier exits 2.
+        for body, want in (("-ws", "\\-ws"), ("[x] y", "\\[x] y"),
+                           ("a-b", "a-b"), ("", "")):
+            got = notifier_argv("tn", "T", body, "w1:p1", "h")[4]
+            assert got == want, (body, got)
+        # Two panes, two groups: they stack rather than replace each other.
+        assert notifier_argv("tn", "T", "B", "w1:p2", "h")[6] != opt["-group"]
+
+        # --jump focuses that pane over that socket.
+        calls = []
+        g["_call"] = lambda m, p: calls.append(
+            (m, p, os.environ.get("HERDR_SOCKET_PATH"))) or {"result": {}}
+        os.environ["HERDR_SOCKET_PATH"] = "/tmp/other.sock"
+        jump("/tmp/my herdr/h.sock", "w1:p1")
+        assert calls == [("pane.focus", {"pane_id": "w1:p1"},
+                          "/tmp/my herdr/h.sock")], calls
+
+        # deliver(): who gets written to, and how many times.
+        posts, ttys = [], []
+        g["clients"] = lambda: [("100", "/dev/ttys001"), ("200", "/dev/ttys002")]
+        g["notifier"] = lambda: "tn"
+        g["host_bundle"] = lambda pid: "dev.warp.Warp-Stable"
+        g["front_bundle"] = lambda: "com.apple.finder"
+        g["toast_delivery"] = lambda: "herdr"
+        g["emit"] = lambda t, b: ttys.append(t) or 2
+
+        def run_tn(rc):
+            def run(argv, **_kw):
+                posts.append(argv)
+                if rc is None:
+                    raise subprocess.TimeoutExpired(argv, 5)
+                return subprocess.CompletedProcess(argv, rc, "", "")
+            return run
+        subprocess.run = run_tn(0)
+
+        def case(**kw):
+            for k, v in kw.items():
+                g[k] = v
+            del posts[:], ttys[:]
+            return deliver("T", "B", "w1:p1")
+
+        # Host in the background: one banner for two clients, no OSC at all.
+        assert case() == ("terminal-notifier", 1)
+        assert len(posts) == 1 and posts[0][0] == "tn" and ttys == [], posts
+        # Host in front: nothing anywhere (Warp would have stayed silent too).
+        assert case(front_bundle=lambda: "dev.warp.Warp-Stable") == (
+            "terminal-notifier", 0)
+        assert posts == [] and ttys == []
+        # Can't tell what is in front, or which app hosts herdr -> Warp route.
+        for k, v in (("front_bundle", lambda: None),
+                     ("host_bundle", lambda pid: None)):
+            assert case(**{k: v}) == ("osc", 2) and posts == [], k
+            g["front_bundle"] = lambda: "com.apple.finder"
+            g["host_bundle"] = lambda pid: "dev.warp.Warp-Stable"
+        # Not installed -> Warp route. No client -> nothing to notify at all.
+        assert case(notifier=lambda: None) == ("osc", 2) and posts == []
+        g["notifier"] = lambda: "tn"
+        g["emit"] = lambda t, b: 0
+        assert case(clients=lambda: []) == ("osc", 0) and posts == []
+        g["clients"] = lambda: [("100", "/dev/ttys001")]
+        g["emit"] = lambda t, b: ttys.append(t) or 1
+        # terminal-notifier fails or vanished -> still notified, once.
+        subprocess.run = run_tn(1)
+        assert case() == ("osc", 1) and len(posts) == 1 and ttys == ["T"]
+        # It hung -> it most likely posted already; no OSC, or that is two.
+        subprocess.run = run_tn(None)
+        assert case() == ("terminal-notifier", 1) and ttys == [], ttys
+
+        def gone(argv, **_kw):
+            raise OSError("no such file")
+        subprocess.run = gone
+        assert case() == ("osc", 1) and ttys == ["T"]
+    finally:
+        g.update(saved[0])
+        subprocess.run, shutil.which, sys.platform = saved[1:4]
+        os.environ.clear()
+        os.environ.update(saved[4])
 
 
 def self_check():
@@ -823,6 +1107,7 @@ def self_check():
         if home:
             os.environ["XDG_CONFIG_HOME"] = home
     check_jump()
+    check_notifier()
 
     # A bare payload still works.
     assert unwrap('{"agent_status":"idle"}')["agent_status"] == "idle"
@@ -845,10 +1130,13 @@ if __name__ == "__main__":
     arg = sys.argv[1] if len(sys.argv) > 1 else ""
     if arg == "--self-check":
         self_check()
+    elif arg == "--jump" and len(sys.argv) == 4:
+        jump(sys.argv[2], sys.argv[3])
     elif arg == "--test":
         title, body = "🔔 Claude needs you", "herdr-warp › main › self-test"
-        n = emit(title, body)
-        print("osc 777 -> %d client tty(s): %s" % (n, client_ttys() or "none found"))
+        route, n = deliver(title, body, None)
+        print("%s -> %d sent, client tty(s): %s"
+              % (route, n, client_ttys() or "none found"))
         print("herdr toast (delivery=%s): %s"
               % (toast_delivery(), toast(title, body) or "skipped"))
     else:
