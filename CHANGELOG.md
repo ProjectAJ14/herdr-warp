@@ -1,3 +1,10 @@
+## [0.4.1](https://github.com/ProjectAJ14/herdr-warp/compare/v0.4.0...v0.4.1) (2026-10-15)
+
+
+### Bug Fixes
+
+* notification clicks work again after macOS leaves a stale terminal-notifier job ([c68493b](https://github.com/ProjectAJ14/herdr-warp/commit/c68493b97091ea127f55f98c3ce2a92069c32c96))
+
 # [0.4.0](https://github.com/ProjectAJ14/herdr-warp/compare/v0.3.0...v0.4.0) (2026-10-04)
 
 
