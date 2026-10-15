@@ -89,6 +89,8 @@ WARP_BUNDLE_PREFIX = "dev.warp."
 # The terminal-notifier route. Herdr's hook PATH can be minimal, so look where
 # Homebrew puts it too. Uninstall it to go back to the Warp route.
 NOTIFIER_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
+# launchd job label macOS gives terminal-notifier's app when a click relaunches it.
+NOTIFIER_JOB_PREFIX = "application.fr.julienxx.oss.terminal-notifier."
 
 # `herdr session attach <name>` is the only client form that leads with a word.
 CLIENT_SUBCOMMANDS = ("session",)
@@ -331,6 +333,30 @@ def notifier():
                             path=os.pathsep.join(NOTIFIER_DIRS)))
 
 
+def clear_stale_jobs():
+    """Remove dead launchd jobs left by terminal-notifier's app.
+
+    launchd sometimes keeps the job of a click relaunch after the app exits.
+    While it is there, every later click fails to relaunch the app ("Submit
+    job failed ... error = 37: Operation already in progress", measured), so
+    the banner closes and nothing runs. A job with no PID ("-") is not running
+    and is safe to drop.
+    """
+    # ponytail: cleared on each post, so a job that goes stale after the last
+    # post still eats clicks on banners already on screen, until the next post.
+    try:
+        out = subprocess.run(["launchctl", "list"], capture_output=True,
+                             text=True, timeout=3).stdout
+        for cols in (line.split() for line in out.splitlines()):
+            if len(cols) == 3 and cols[0] == "-" \
+                    and cols[2].startswith(NOTIFIER_JOB_PREFIX):
+                subprocess.run(["launchctl", "remove", cols[2]],
+                               capture_output=True, timeout=3)
+                trace("removed stale launchd job %s" % cols[2])
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def notifier_argv(tn, title, body, pane_id, host):
     """One banner, grouped per pane, whose click focuses that pane."""
     sock = os.environ.get("HERDR_SOCKET_PATH") or ""
@@ -377,6 +403,7 @@ def deliver(title, body, pane_id):
         if toast_delivery() in ("terminal", "system"):
             trace("delivery=%s: Herdr may raise its own banner as well"
                   % toast_delivery())
+        clear_stale_jobs()
         try:
             # Exits as soon as the banner is posted; the click is handled by
             # terminal-notifier's own app later, not by this process.
@@ -907,7 +934,32 @@ def check_notifier():
         assert calls == [("pane.focus", {"pane_id": "w1:p1"},
                           "/tmp/my herdr/h.sock")], calls
 
+        # Stale terminal-notifier jobs: only the dead ones (PID "-") with its
+        # label go; a running one, other apps, and launchctl failing are left.
+        listed = ("PID\tStatus\tLabel\n"
+                  "-\t0\tapplication.fr.julienxx.oss.terminal-notifier.1.2\n"
+                  "123\t0\tapplication.fr.julienxx.oss.terminal-notifier.3.4\n"
+                  "-\t0\tapplication.dev.warp.Warp-Stable.5.6\n")
+        launchctl = []
+
+        def lc(argv, **_kw):
+            launchctl.append(argv)
+            return subprocess.CompletedProcess(argv, 0, listed, "")
+        subprocess.run = lc
+        clear_stale_jobs()
+        assert launchctl[1:] == [["launchctl", "remove",
+                                  "application.fr.julienxx.oss.terminal-notifier.1.2"]
+                                 ], launchctl
+
+        def no_launchctl(argv, **_kw):
+            raise OSError("no launchctl")
+        subprocess.run = no_launchctl
+        clear_stale_jobs()      # must not raise
+        subprocess.run = saved[1]
+
         # deliver(): who gets written to, and how many times.
+        cleared = []
+        g["clear_stale_jobs"] = lambda: cleared.append(1)
         posts, ttys = [], []
         g["clients"] = lambda: [("100", "/dev/ttys001"), ("200", "/dev/ttys002")]
         g["notifier"] = lambda: "tn"
@@ -934,6 +986,7 @@ def check_notifier():
         # Host in the background: one banner for two clients, no OSC at all.
         assert case() == ("terminal-notifier", 1)
         assert len(posts) == 1 and posts[0][0] == "tn" and ttys == [], posts
+        assert cleared, "stale jobs not cleared before posting"
         # Host in front: nothing anywhere (Warp would have stayed silent too).
         assert case(front_bundle=lambda: "dev.warp.Warp-Stable") == (
             "terminal-notifier", 0)
