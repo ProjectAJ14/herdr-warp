@@ -469,6 +469,18 @@ Each line records the raw event Herdr passed in, the route (`osc` or
 click-to-jump was armed, and later `jumped to <pane>: ok` when it fires —
 from the waiter, or from a clicked terminal-notifier banner. Delete the `debug` file to turn it back off.
 
+If clicking a terminal-notifier banner does nothing and the log has no
+`jumped to` line, macOS could not relaunch terminal-notifier: a dead launchd
+job for it blocks the relaunch (`/usr/bin/log show --last 5m --predicate
+'eventMessage CONTAINS "julienxx"'` shows `error = 37: Operation already in
+progress`). The plugin removes such jobs before posting each banner and logs
+`removed stale launchd job …`. To clear one by hand:
+
+```bash
+launchctl list | grep julienxx         # the dead one has "-" as its PID
+launchctl remove <that label>
+```
+
 If it never fires, confirm the hook is registered:
 
 ```bash
